@@ -2,10 +2,84 @@ import mongoose from "mongoose";
 import Interview from "../models/Interview.js";
 import {
   generateQuestions,
+  generateResumeInterviewQuestions,
   evaluateAnswer,
   generateFinalReport,
   askAIClarification,
 } from "../services/aiService.js";
+import { extractTextFromResume } from "../services/resumeParser.js";
+
+export const startResumeInterview = async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({
+        message: "Please upload your resume in PDF (.pdf) or Word (.docx) format.",
+      });
+    }
+
+    const { questionCount } = req.body;
+    const interviewMode = "open-ended"; // Resume interview is always a realistic conversational mock interview
+    const count = Math.min(Math.max(Number(questionCount) || 5, 3), 20);
+
+    // Extract raw text from uploaded resume buffer
+    const resumeText = await extractTextFromResume(
+      req.file.buffer,
+      req.file.mimetype,
+      req.file.originalname
+    );
+
+    if (!resumeText || resumeText.length < 50) {
+      return res.status(400).json({
+        message:
+          "Unable to extract readable text from the uploaded resume. Please verify the document contains selectable text and try again.",
+      });
+    }
+
+    // Automatically analyze skills, seniority & projects from the resume and generate questions
+    const {
+      detectedRole,
+      detectedDifficulty,
+      extractedSkills,
+      identifiedProjects,
+      questions,
+    } = await generateResumeInterviewQuestions(
+      resumeText,
+      "Adaptive",
+      count,
+      interviewMode
+    );
+
+    if (!questions || questions.length === 0) {
+      return res.status(500).json({
+        message: "Failed to generate interview questions from resume. Please try again.",
+      });
+    }
+
+    const interview = await Interview.create({
+      user: req.user.id,
+      role: detectedRole || "Resume Technical Profile",
+      difficulty: detectedDifficulty || "Adaptive (Resume Analyzed)",
+      mode: interviewMode,
+      isResumeBased: true,
+      resumeFileName: req.file.originalname,
+      extractedSkills: extractedSkills || [],
+      identifiedProjects: identifiedProjects || [],
+      questions: questions.map((q) => ({
+        question: q.question,
+        options: q.options || [],
+        correctOption: q.correctOption || "",
+        explanation: q.explanation || "",
+      })),
+    });
+
+    res.status(201).json(interview);
+  } catch (err) {
+    console.error("Start resume interview error:", err);
+    res.status(500).json({
+      message: err.message || "Failed to start resume-based interview",
+    });
+  }
+};
 
 export const startInterview = async (req, res) => {
   try {
@@ -14,11 +88,13 @@ export const startInterview = async (req, res) => {
       return res.status(400).json({ message: "Role is required" });
     }
 
+    const interviewMode = mode || "mcq";
     const count = Math.min(Math.max(Number(questionCount) || 10, 3), 20);
     const questions = await generateQuestions(
       role.trim(),
       difficulty || "Medium",
-      count
+      count,
+      interviewMode
     );
 
     if (!questions || questions.length === 0) {
@@ -29,11 +105,11 @@ export const startInterview = async (req, res) => {
       user: req.user.id,
       role: role.trim(),
       difficulty: difficulty || "Medium",
-      mode: mode || "hybrid",
+      mode: interviewMode,
       questions: questions.map((q) => ({
         question: q.question,
         options: q.options || [],
-        correctOption: q.correctOption || "A",
+        correctOption: q.correctOption || "",
         explanation: q.explanation || "",
       })),
     });
@@ -62,9 +138,9 @@ export const submitAnswer = async (req, res) => {
       return res.status(400).json({ message: "Valid numeric questionIndex is required" });
     }
 
-    const chosenText = answer || selectedOption || "";
-    if (!chosenText.trim()) {
-      return res.status(400).json({ message: "Please select an option or provide an answer" });
+    const chosenText = (answer || selectedOption || "").trim();
+    if (!chosenText) {
+      return res.status(400).json({ message: "Please provide an answer or speak into microphone" });
     }
 
     const interview = await Interview.findOne({
@@ -88,12 +164,12 @@ export const submitAnswer = async (req, res) => {
     const q = interview.questions[questionIndex];
     const { score, feedback, isCorrect } = await evaluateAnswer(
       q,
-      chosenText.trim(),
+      chosenText,
       selectedOption || ""
     );
 
-    interview.questions[questionIndex].userSelectedOption = selectedOption || chosenText.trim().charAt(0);
-    interview.questions[questionIndex].answer = chosenText.trim();
+    interview.questions[questionIndex].userSelectedOption = selectedOption || "";
+    interview.questions[questionIndex].answer = chosenText;
     interview.questions[questionIndex].score = score;
     interview.questions[questionIndex].feedback = feedback;
     await interview.save();
@@ -103,9 +179,10 @@ export const submitAnswer = async (req, res) => {
       score,
       feedback,
       isCorrect,
-      correctOption: q.correctOption,
-      explanation: q.explanation,
+      correctOption: q.correctOption || "",
+      explanation: q.explanation || "",
       userSelectedOption: interview.questions[questionIndex].userSelectedOption,
+      answer: chosenText,
     });
   } catch (err) {
     console.error("Submit answer error:", err);
@@ -160,7 +237,7 @@ export const getAllInterviews = async (req, res) => {
   try {
     const list = await Interview.find({ user: req.user.id })
       .sort({ createdAt: -1 })
-      .select("role difficulty totalScore status createdAt questions");
+      .select("role difficulty totalScore status mode createdAt questions isResumeBased resumeFileName extractedSkills");
     
     // Add summary count of questions and answered questions
     const formatted = list.map((doc) => {
@@ -170,11 +247,15 @@ export const getAllInterviews = async (req, res) => {
         _id: doc._id,
         role: doc.role,
         difficulty: doc.difficulty,
+        mode: doc.mode || "open-ended",
         totalScore: doc.totalScore,
         status: doc.status,
         createdAt: doc.createdAt,
         totalQuestions: qCount,
         answeredQuestions: answeredCount,
+        isResumeBased: !!doc.isResumeBased,
+        resumeFileName: doc.resumeFileName || "",
+        extractedSkills: doc.extractedSkills || [],
       };
     });
 
